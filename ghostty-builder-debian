@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+  #=================================================
+  # Project: ghostty-builder-debian
+  # Author:  ConzZah / 2025
+  # Last Modification: 26.02.2025 / 20:54  [v1.0]
+  #=================================================
+init () {
+zigversion="0.13.0"
+architecture="$(uname -m)"
+zig="zig-linux-$architecture-$zigversion"
+if [[ ! "$architecture" =~ ^(x86_64|aarch64)$ ]]; then echo -e "\nsorry, $architecture is not supported."; quit; fi
+if [[ "$architecture" == "aarch64" ]]; then gcc_multilib=""; else gcc_multilib="gcc-multilib"; fi 
+deps="git curl pkg-config libgtk-4-dev libadwaita-1-dev blueprint-compiler libxml2-utils dbus-x11 $gcc_multilib"
+echo -e "\n👻 ConzZah's Ghostty Builder for Debian 👻 \n"
+wd="$HOME/.ghostty-builder-debian"; mkdir -p "$wd"; cd "$wd"
+zig_check ;}
+
+zig_check () {
+# check if zig is on the system and if it's actually v0.13.0. if not, get it.
+echo -e "CHECKING FOR ZIG...\n" && ! type -p zig >/dev/null && echo -e "ZIG NOT FOUND! \n" && install_zig \
+|| [[ "$(zig version)" != "$zigversion" ]] && echo -e "INCOMPATIBLE VERSION OF ZIG FOUND, GETTING $zigversion .. \n" && install_zig
+echo -e "ZIG v$zigversion FOUND.\n" && get_ghostty_deps ;}
+
+install_zig () {
+# download & install zig
+curl -#LO "https://ziglang.org/download/$zigversion/$zig.tar.xz"
+tar xf "$zig.tar.xz" && cd "$zig" && \
+sudo mv -f zig lib/ /usr/local/bin/ && \
+cd .. && rm -rf "$zig" "$zig.tar.xz" && \
+export PATH=$PATH:/usr/local/bin/zig && get_ghostty_deps || \
+echo "zig couldn't be installed, exiting.." && exit 1 ;}
+
+get_ghostty_deps () { 
+## check for dependencies, so we don't fetch them unnecessarily
+echo -e "CHECKING FOR MISSING DEPENDENCIES..\n"
+[ -f ".missing" ] && rm -f .missing
+for dep in $deps; do
+dep_status="$(dpkg -l "$dep"| tail -n1| cut -c -2)"
+if [[ "$dep_status" =~ ^("un"|"")$ ]]; then echo "MISSING: $dep"; missing="$missing $dep"; else echo "FOUND: $dep"; fi 
+done
+[ -n "$missing" ] && { echo -e "\n INSTALLING MISSING DEPENDENCIES.."; sudo apt install -y $missing ;} 
+fetch_latest_version_numbers ;}
+
+fetch_latest_version_numbers () {
+# get the latest commit hash + latest stable version number
+echo -e "\nCHECKING FOR NEW GHOSTTY VERSION.."
+# fetch latest stable version number
+latest_stable="$(curl -sL https://github.com/ghostty-org/ghostty/tags| grep "/ghostty-org/ghostty/releases/tag/"| sed s'#tip##'g| cut -d "/" -f 6| cut -d '"' -f 1| tr -d '\n'| cut -d "v" -f2)"
+# fetch latest remote commit hash (ackshually, the first 8 characters of the latest hash so we can compare them with local in the next step.)
+latest_remote_commit="$(curl -sL -H "Accept: application/vnd.github+json" \
+-H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/ghostty-org/ghostty/commits \
+| head -n3| tail -n1| cut -d '"' -f 4| cut -c -8)"
+detect_ghostty ;}
+
+detect_ghostty () {
+# check if and which version of ghostty is currently installed
+echo -e "\nCHECKING FOR EXISTING INSTALL .. \n"
+ghostty_local="$(type -p ghostty >/dev/null && ghostty --version| head -n1| cut -d ' ' -f 2)"
+[ -z "$ghostty_local" ] && echo -e "GHOSTTY NOT YET INSTALLED. \n" && choose_channel && build_ghostty || \
+release_channel="$(ghostty --version| grep "channel"| cut -c 14-)" && echo -e "LOCALLY FOUND: ghostty $release_channel v$ghostty_local \n"
+
+# if $switch_channnel is set, skip the update check and jump to build
+[ -n "$switch_channnel" ] && echo -e "SWITCHING TO: $switch_channnel \n" && release_channel="$switch_channnel" && build_ghostty
+
+# if any version is found, determine if we're up to date 
+up2date="👻 GHOSTTY IS UP TO DATE. 👻"
+[[ "$release_channel" == "stable" ]] && if [[ "$ghostty_local" == "$latest_stable" ]]; then echo "$up2date" && quit; fi 
+[[ "$release_channel" == "tip" ]] && local_commit="$(echo "$ghostty_local"| cut -d '+' -f 2)" && \
+if [[ "$latest_remote_commit" == "$local_commit" ]]; then echo "$up2date" && quit; fi
+
+# if the remote version differs from the currently installed one, show version num/commit & attempt to build:
+if [ -n "$latest_remote_commit" ]; then new_version="$latest_remote_commit"; else new_version="v$latest_stable"; fi 
+echo -e "NEW VERSION/COMMIT FOUND: $new_version"; build_ghostty ;}
+
+choose_channel () {
+# if ghostty is not yet installed, ask the user if they want stable or tip (latest commit)
+## note that in order to switch channels later, one would have to call the script with either "stable" or "tip", as defined below.
+echo -e "CHOOSE A RELEASE CHANNEL \n\n1) STABLE \n2) TIP \n"
+read release_channel
+case $release_channel in
+1|stable|STABLE) echo "CHOOSING STABLE"; release_channel="stable";;
+2|tip|TIP) echo "CHOOSING TIP";;
+*) echo "CHOOSING STABLE AUTOMATICALLY"; release_channel="stable"
+esac ;}
+
+checkout_if_stable () { [[ "$release_channel" == "stable" ]] && git checkout "v$latest_stable" ;}
+
+build_ghostty () {
+## (finally) clone & build ghostty
+echo -e "\nATTEMPTING TO BUILD GHOSTTY \n"
+cd "$wd" && [ -d "ghostty" ] && sudo rm -rf "ghostty"
+git clone https://github.com/ghostty-org/ghostty; cd ghostty
+checkout_if_stable; sudo zig build -p /usr -Doptimize=ReleaseFast -Dcpu=baseline && \
+ghostty --version && echo -e "\n👻 GHOSTTY READY! 👻 \n" && is_default || echo "ERROR: BUILD FAILED" && exit 1 ;}
+
+is_default () {
+## check if ghostty is the default terminal emulator already, or if the user didn't want to be asked again, if so, nothing more is needed.
+[ -f .nodefault ] && quit || update-alternatives --list x-terminal-emulator| grep -q "ghostty" && grep -q "ghostty" /etc/alternatives/x-terminal-emulator && quit
+## otherwise ask if we should set ghostty as default
+echo -e "\nWOULD YOU LIKE TO SET GHOSTTY AS YOUR DEFAULT TERMINAL EMULATOR ? \n\ny) YES\nn) NO\nN) NO, DON'T ASK AGAIN\n"
+read default
+case $default in
+1|y|Y|yes) echo "SETTING GHOSTTY AS DEFAULT"
+if ! update-alternatives --list x-terminal-emulator| grep -q "ghostty"; then sudo update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator /usr/bin/ghostty 420; fi
+sudo update-alternatives --set x-terminal-emulator /usr/bin/ghostty; quit;;
+2|n|no) echo "GHOSTTY WILL NOT BE SET AS DEFAULT"; quit ;;
+3|N|NO) echo "GHOSTTY WILL NOT BE SET AS DEFAULT AND YOU WON'T BE ASKED AGAIN."; echo 1 > .nodefault; quit ;;
+*) echo "GHOSTTY WILL NOT BE SET AS DEFAULT"; quit
+esac ;}
+
+quit () { echo -e "\nPRESS ANY KEY TO EXIT"; read -n1 s; exit 0  ;}
+
+####################################################################
+# $switch_channnel sets/switches the preferred release channel: 
+if [[ "$1" == "stable" ]]; then switch_channnel="stable"; fi
+if [[ "$1" == "tip" ]]; then switch_channnel="tip"; fi
+
+## checks if your machine is connected to the internet by pinging github once, then starts
+###############################################################################################
+ping -q -c 1 github.com >/dev/null 2>&1 && init || echo -e "\nYOU SEEM TO BE OFFLINE." && quit 
+###############################################################################################
